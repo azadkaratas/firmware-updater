@@ -1,0 +1,4 @@
+config BR2_PACKAGE_FIRMWARE_UPDATER
+    bool "firmware-updater"
+    help
+      A generic firmware update tool for embedded systems.
