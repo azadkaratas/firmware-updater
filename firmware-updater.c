@@ -221,54 +221,86 @@ static int update_boot_config(const Config *config, FILE *log_fp) {
 
     char cmdline_path[256];
     snprintf(cmdline_path, sizeof(cmdline_path), "%s/cmdline.txt", config->mount_point);
-    FILE *fp = fopen(cmdline_path, "r+");
-    if (!fp) {
-        snprintf(msg, sizeof(msg), "ERROR: Failed to open cmdline.txt: %s", strerror(errno));
+
+    // Open cmdline.txt for reading
+    FILE *read_fp = fopen(cmdline_path, "r");
+    if (!read_fp) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to open cmdline.txt for reading: %s", strerror(errno));
         log_message(log_fp, msg);
         umount(config->mount_point);
         return -1;
     }
 
     char line[256] = {0};
-    if (!fgets(line, sizeof(line), fp)) {
-        log_message(log_fp, "ERROR: Failed to read cmdline.txt");
-        fclose(fp);
-        umount(config->mount_point);
-        return -1;
-    }
-
-    char *pos = strstr(line, "root=/dev/mmcblk0p");
-    if (pos) {
-        size_t remaining_space = sizeof(line) - (pos - line);
-        size_t required_len = strlen("root=") + strlen(config->next_rootfs) + 1;
-        if (required_len > remaining_space) {
-            log_message(log_fp, "ERROR: cmdline.txt buffer too small for new rootfs");
-            fclose(fp);
-            umount(config->mount_point);
-            return -1;
-        }
-
-        snprintf(pos, remaining_space, "root=%s", config->next_rootfs);
-        if (fseek(fp, 0, SEEK_SET) != 0 || fputs(line, fp) == EOF || ftruncate(fileno(fp), ftell(fp)) != 0) {
-            log_message(log_fp, "ERROR: Failed to update cmdline.txt");
-            fclose(fp);
-            umount(config->mount_point);
-            return -1;
-        }
-        snprintf(msg, sizeof(msg), "Updated cmdline: %s", line);
+    if (!fgets(line, sizeof(line), read_fp)) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to read cmdline.txt: %s", strerror(errno));
         log_message(log_fp, msg);
-    } else {
-        log_message(log_fp, "ERROR: Could not find root= parameter in cmdline.txt");
-        fclose(fp);
+        fclose(read_fp);
+        umount(config->mount_point);
+        return -1;
+    }
+    fclose(read_fp);
+
+    // Log original content
+    snprintf(msg, sizeof(msg), "Original cmdline: %s", line);
+    log_message(log_fp, msg);
+
+    // Remove trailing newline if present
+    line[strcspn(line, "\n")] = '\0';
+
+    // Find and replace root= parameter
+    char *pos = strstr(line, "root=/dev/mmcblk0p");
+    if (!pos) {
+        snprintf(msg, sizeof(msg), "ERROR: Could not find root= parameter in cmdline.txt");
+        log_message(log_fp, msg);
         umount(config->mount_point);
         return -1;
     }
 
-    fclose(fp);
+    char *end = pos + strcspn(pos, " \n"); // Find end of root= parameter
+    size_t prefix_len = pos - line;
+    size_t suffix_len = strlen(end);
+    char new_line[256];
+
+    // Construct new line: prefix + new root + suffix
+    snprintf(new_line, sizeof(new_line), "%.*sroot=%s%s",
+             (int)prefix_len, line, config->next_rootfs, end);
+
+    // Open cmdline.txt for writing
+    FILE *write_fp = fopen(cmdline_path, "w");
+    if (!write_fp) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to open cmdline.txt for writing: %s", strerror(errno));
+        log_message(log_fp, msg);
+        umount(config->mount_point);
+        return -1;
+    }
+
+    if (fputs(new_line, write_fp) == EOF) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to write new cmdline.txt: %s", strerror(errno));
+        log_message(log_fp, msg);
+        fclose(write_fp);
+        umount(config->mount_point);
+        return -1;
+    }
+
+    if (fflush(write_fp) != 0 || fsync(fileno(write_fp)) != 0) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to sync cmdline.txt: %s", strerror(errno));
+        log_message(log_fp, msg);
+        fclose(write_fp);
+        umount(config->mount_point);
+        return -1;
+    }
+
+    fclose(write_fp);
+
+    // Log updated content
+    snprintf(msg, sizeof(msg), "Updated cmdline: %s", new_line);
+    log_message(log_fp, msg);
+
     if (umount(config->mount_point)) {
         snprintf(msg, sizeof(msg), "ERROR: Failed to unmount %s: %s", config->mount_point, strerror(errno));
         log_message(log_fp, msg);
-        return -1; // Critical error, do not proceed
+        return -1;
     }
 
     log_message(log_fp, "Boot configuration updated successfully");
