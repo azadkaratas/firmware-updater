@@ -17,7 +17,6 @@
 static const char *default_boot_partition = "/dev/mmcblk0p1";
 static const char *default_log_file = "/var/log/updatefw.log";
 static const char *default_mount_point = "/tmp/tmpboot";
-static const int default_min_space_mb = 220;
 
 // Configuration structure
 typedef struct {
@@ -27,7 +26,6 @@ typedef struct {
     char *current_rootfs;
     char *next_rootfs;
     char *mount_point;
-    int min_space_mb;
 } Config;
 
 // Cleanup function for Config structure
@@ -59,26 +57,6 @@ static void check_root(FILE *log_fp) {
         log_message(log_fp, "ERROR: This program must run as root");
         exit(EXIT_FAILURE);
     }
-}
-
-// Check available disk space in MB
-static int check_disk_space(const char *path, int min_space_mb, FILE *log_fp) {
-    struct statfs stat;
-    if (statfs(path, &stat) != 0) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "ERROR: Failed to check disk space on %s: %s", path, strerror(errno));
-        log_message(log_fp, msg);
-        return -1;
-    }
-    long free_mb = (long)((stat.f_bavail * stat.f_bsize) / (1024.0 * 1024.0));
-    if (free_mb < min_space_mb) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "ERROR: Insufficient disk space on %s. Required: %d MB, Available: %ld MB",
-                 path, min_space_mb, free_mb);
-        log_message(log_fp, msg);
-        return -1;
-    }
-    return 0;
 }
 
 // Detect current and next rootfs from /proc/cmdline
@@ -316,7 +294,6 @@ static void print_usage() {
     printf("  -b, --boot-partition DEV  Boot partition device (default: %s)\n", default_boot_partition);
     printf("  -l, --log-file PATH       Log file path (default: %s)\n", default_log_file);
     printf("  -m, --mount-point PATH    Temporary mount point (default: %s)\n", default_mount_point);
-    printf("  -s, --min-space MB        Minimum free space in MB (default: %d)\n", default_min_space_mb);
     printf("  -h, --help                Show this help message\n");
 }
 
@@ -326,7 +303,6 @@ int main(int argc, char *argv[]) {
         .boot_partition = (char *)default_boot_partition,
         .log_file = (char *)default_log_file,
         .mount_point = (char *)default_mount_point,
-        .min_space_mb = default_min_space_mb,
         .current_rootfs = NULL,
         .next_rootfs = NULL
     };
@@ -336,25 +312,17 @@ int main(int argc, char *argv[]) {
         {"boot-partition", required_argument, 0, 'b'},
         {"log-file", required_argument, 0, 'l'},
         {"mount-point", required_argument, 0, 'm'},
-        {"min-space", required_argument, 0, 's'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "u:b:l:m:s:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "u:b:l:m:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'u': config.update_file = optarg; break;
             case 'b': config.boot_partition = optarg; break;
             case 'l': config.log_file = optarg; break;
             case 'm': config.mount_point = optarg; break;
-            case 's':
-                config.min_space_mb = atoi(optarg);
-                if (config.min_space_mb <= 0) {
-                    fprintf(stderr, "ERROR: Minimum space must be a positive integer\n");
-                    exit(EXIT_FAILURE);
-                }
-                break;
             case 'h': print_usage(); exit(EXIT_SUCCESS);
             default: print_usage(); exit(EXIT_FAILURE);
         }
@@ -385,7 +353,6 @@ int main(int argc, char *argv[]) {
 
     int status = 0;
     if (detect_rootfs(&config, log_fp) != 0 ||
-        check_disk_space("/tmp", config.min_space_mb, log_fp) != 0 ||
         install_firmware(config.update_file, config.next_rootfs, log_fp) != 0 ||
         update_boot_config(&config, log_fp) != 0) {
         status = -1;
