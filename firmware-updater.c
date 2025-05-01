@@ -69,7 +69,7 @@ static int detect_rootfs(Config *config, FILE *log_fp) {
         return -1;
     }
 
-    char line[256];
+    char line[1024];
     if (!fgets(line, sizeof(line), fp)) {
         log_message(log_fp, "ERROR: Failed to read /proc/cmdline");
         fclose(fp);
