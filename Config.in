@@ -1,4 +1,6 @@
 config BR2_PACKAGE_FIRMWARE_UPDATER
     bool "firmware-updater"
+    depends on BR2_PACKAGE_OPENSSL
+    depends on BR2_PACKAGE_LIBARCHIVE
     help
       A generic firmware update tool for embedded systems.

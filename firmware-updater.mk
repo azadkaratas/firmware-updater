@@ -11,7 +11,7 @@ FIRMWARE_UPDATER_SITE = $(FIRMWARE_UPDATER_PKGDIR)
 FIRMWARE_UPDATER_SOURCE = firmware-updater.c
 
 define FIRMWARE_UPDATER_BUILD_CMDS
-	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
+	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -lssl -lcrypto -larchive \
 		$(FIRMWARE_UPDATER_PKGDIR)/firmware-updater.c -o $(@D)/firmware-updater
 endef
 

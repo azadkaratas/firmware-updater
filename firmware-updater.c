@@ -10,13 +10,21 @@
 #include <time.h>
 #include <sys/vfs.h>
 #include <getopt.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/sha.h>
+#include <openssl/err.h>
+#include <archive.h>
+#include <archive_entry.h>
 
 #define DD_BLOCK_SIZE (4 * 1024 * 1024) // 4MB block size for file copying
 
 // Default values
 static const char *default_boot_partition = "/dev/mmcblk0p1";
 static const char *default_log_file = "/var/log/updatefw.log";
-static const char *default_mount_point = "/tmp/tmpboot";
+static const char *default_mount_point = "/dune/tmp/tmpboot";
+static const char *default_public_key = "/etc/dune/keys/img_pub.pem";
+static const char *default_temp_dir = "/dune/tmp/firmware_update";
 
 // Configuration structure
 typedef struct {
@@ -26,6 +34,8 @@ typedef struct {
     char *current_rootfs;
     char *next_rootfs;
     char *mount_point;
+    char *public_key;
+    char *temp_dir;
 } Config;
 
 // Cleanup function for Config structure
@@ -97,6 +107,149 @@ static int detect_rootfs(Config *config, FILE *log_fp) {
     char msg[256];
     snprintf(msg, sizeof(msg), "Current rootfs: %s, Next rootfs: %s",
              config->current_rootfs, config->next_rootfs);
+    log_message(log_fp, msg);
+    return 0;
+}
+
+// Verify firmware signature
+static int verify_firmware(const char *input_file, const char *sig_file, const char *public_key_file, FILE *log_fp) {
+    char msg[256];
+    FILE *in_fp = NULL, *sig_fp = NULL;
+    RSA *rsa = NULL;
+    unsigned char *buffer = NULL, *signature = NULL;
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    size_t file_size, sig_len;
+    int ret = 1;
+
+    ERR_load_crypto_strings();
+    OpenSSL_add_all_algorithms();
+
+    // Public key'i oku
+    FILE *key_fp = fopen(public_key_file, "r");
+    if (!key_fp) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to open public key %s: %s", public_key_file, strerror(errno));
+        log_message(log_fp, msg);
+        goto cleanup;
+    }
+    rsa = PEM_read_RSA_PUBKEY(key_fp, NULL, NULL, NULL);
+    fclose(key_fp);
+    if (!rsa) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to read public key");
+        log_message(log_fp, msg);
+        ERR_print_errors_fp(stderr);
+        goto cleanup;
+    }
+
+    // Firmware dosyasını oku
+    in_fp = fopen(input_file, "rb");
+    if (!in_fp) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to open firmware file %s: %s", input_file, strerror(errno));
+        log_message(log_fp, msg);
+        goto cleanup;
+    }
+    fseek(in_fp, 0, SEEK_END);
+    file_size = ftell(in_fp);
+    fseek(in_fp, 0, SEEK_SET);
+    buffer = (unsigned char *)malloc(file_size);
+    if (!buffer || fread(buffer, 1, file_size, in_fp) != file_size) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to read firmware file");
+        log_message(log_fp, msg);
+        goto cleanup;
+    }
+
+    // SHA256 hash'ini hesapla
+    SHA256(buffer, file_size, hash);
+
+    // İmzayı oku
+    sig_fp = fopen(sig_file, "rb");
+    if (!sig_fp) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to open signature file %s: %s", sig_file, strerror(errno));
+        log_message(log_fp, msg);
+        goto cleanup;
+    }
+    fseek(sig_fp, 0, SEEK_END);
+    sig_len = ftell(sig_fp);
+    fseek(sig_fp, 0, SEEK_SET);
+    signature = (unsigned char *)malloc(sig_len);
+    if (!signature || fread(signature, 1, sig_len, sig_fp) != sig_len) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to read signature file");
+        log_message(log_fp, msg);
+        goto cleanup;
+    }
+
+    // İmzayı doğrula
+    if (RSA_verify(NID_sha256, hash, SHA256_DIGEST_LENGTH, signature, sig_len, rsa)) {
+        log_message(log_fp, "Signature verification successful");
+        ret = 0;
+    } else {
+        snprintf(msg, sizeof(msg), "ERROR: Signature verification failed");
+        log_message(log_fp, msg);
+        ERR_print_errors_fp(stderr);
+    }
+
+cleanup:
+    if (in_fp) fclose(in_fp);
+    if (sig_fp) fclose(sig_fp);
+    if (buffer) free(buffer);
+    if (signature) free(signature);
+    if (rsa) RSA_free(rsa);
+    EVP_cleanup();
+    ERR_free_strings();
+    return ret;
+}
+
+// Uncompress tar file to a temporary directory using libarchive
+static int uncompress_tar(const char *tar_file, const char *temp_dir, FILE *log_fp) {
+    char msg[256];
+    struct archive *a;
+    struct archive_entry *entry;
+    int r;
+
+    // Geçici dizini oluştur
+    if (mkdir(temp_dir, 0755) && errno != EEXIST) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to create temporary directory %s: %s", temp_dir, strerror(errno));
+        log_message(log_fp, msg);
+        return -1;
+    }
+
+    // Arşivi oku
+    a = archive_read_new();
+    archive_read_support_format_tar(a);
+    archive_read_support_filter_gzip(a);
+    r = archive_read_open_filename(a, tar_file, 10240);
+    if (r != ARCHIVE_OK) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to open tar file %s: %s", tar_file, archive_error_string(a));
+        log_message(log_fp, msg);
+        archive_read_free(a);
+        return -1;
+    }
+
+    // Dosyaları çıkar
+    while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
+        const char *entry_path = archive_entry_pathname(entry);
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/%s", temp_dir, entry_path);
+
+        // Dosya yolunu güncelle
+        archive_entry_set_pathname(entry, full_path);
+
+        // Dosyayı çıkar
+        r = archive_read_extract(a, entry, ARCHIVE_EXTRACT_PERM | ARCHIVE_EXTRACT_TIME);
+        if (r != ARCHIVE_OK) {
+            snprintf(msg, sizeof(msg), "ERROR: Failed to extract %s: %s", entry_path, archive_error_string(a));
+            log_message(log_fp, msg);
+            archive_read_free(a);
+            return -1;
+        }
+
+        snprintf(msg, sizeof(msg), "Extracted to %s", full_path);
+        log_message(log_fp, msg);
+    }
+
+    archive_read_close(a);
+    archive_read_free(a);
+
+    snprintf(msg, sizeof(msg), "Successfully extracted %s to %s", tar_file, temp_dir);
     log_message(log_fp, msg);
     return 0;
 }
@@ -173,7 +326,7 @@ static int install_firmware(const char *src, const char *dst, FILE *log_fp) {
     }
 
     free(buffer);
-    snprintf(msg, sizeof(msg), "Firmware installation completed. Total bytes written: %ld", total_bytes);
+    snprintf(msg, sizeof(msg), "Firmware installation completed. Total Mbytes written: %ld", total_bytes/1024/1024);
     log_message(log_fp, msg);
     return 0;
 }
@@ -289,11 +442,13 @@ static int update_boot_config(const Config *config, FILE *log_fp) {
 static void print_usage() {
     printf("Usage: firmware-updater -u <update_file> [options]\n");
     printf("Required:\n");
-    printf("  -u, --update-file PATH    Firmware update file (required)\n");
+    printf("  -u, --update-file PATH    Firmware update tar file (required)\n");
     printf("Options:\n");
     printf("  -b, --boot-partition DEV  Boot partition device (default: %s)\n", default_boot_partition);
     printf("  -l, --log-file PATH       Log file path (default: %s)\n", default_log_file);
     printf("  -m, --mount-point PATH    Temporary mount point (default: %s)\n", default_mount_point);
+    printf("  -p, --public-key PATH     Public key file (default: %s)\n", default_public_key);
+    printf("  -t, --temp-dir PATH       Temporary directory for extraction (default: %s)\n", default_temp_dir);
     printf("  -h, --help                Show this help message\n");
 }
 
@@ -303,6 +458,8 @@ int main(int argc, char *argv[]) {
         .boot_partition = (char *)default_boot_partition,
         .log_file = (char *)default_log_file,
         .mount_point = (char *)default_mount_point,
+        .public_key = (char *)default_public_key,
+        .temp_dir = (char *)default_temp_dir,
         .current_rootfs = NULL,
         .next_rootfs = NULL
     };
@@ -312,17 +469,21 @@ int main(int argc, char *argv[]) {
         {"boot-partition", required_argument, 0, 'b'},
         {"log-file", required_argument, 0, 'l'},
         {"mount-point", required_argument, 0, 'm'},
+        {"public-key", required_argument, 0, 'p'},
+        {"temp-dir", required_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "u:b:l:m:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "u:b:l:m:p:t:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'u': config.update_file = optarg; break;
             case 'b': config.boot_partition = optarg; break;
             case 'l': config.log_file = optarg; break;
             case 'm': config.mount_point = optarg; break;
+            case 'p': config.public_key = optarg; break;
+            case 't': config.temp_dir = optarg; break;
             case 'h': print_usage(); exit(EXIT_SUCCESS);
             default: print_usage(); exit(EXIT_FAILURE);
         }
@@ -338,43 +499,121 @@ int main(int argc, char *argv[]) {
         printf("WARNING: Could not open log file %s: %s\n", config.log_file, strerror(errno));
     }
 
-    char start_msg[256];
-    snprintf(start_msg, sizeof(start_msg), "Starting firmware update process...");
-    log_message(log_fp, start_msg);
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Starting firmware update process...");
+    log_message(log_fp, msg);
 
     check_root(log_fp);
 
+    // Check if update file exist
     if (access(config.update_file, F_OK | R_OK) != 0) {
-        snprintf(start_msg, sizeof(start_msg), "ERROR: Firmware file %s doesn't exist or is not readable", config.update_file);
-        log_message(log_fp, start_msg);
+        snprintf(msg, sizeof(msg), "ERROR: Firmware file %s doesn't exist or is not readable", config.update_file);
+        log_message(log_fp, msg);
         if (log_fp) fclose(log_fp);
         exit(EXIT_FAILURE);
     }
 
-    int status = 0;
-    if (detect_rootfs(&config, log_fp) != 0 ||
-        install_firmware(config.update_file, config.next_rootfs, log_fp) != 0 ||
-        update_boot_config(&config, log_fp) != 0) {
-        status = -1;
+    // Uncompress the tar file
+    snprintf(msg, sizeof(msg), "Uncompressing image file %s...", config.update_file);
+    log_message(log_fp, msg);
+    if (uncompress_tar(config.update_file, config.temp_dir, log_fp) != 0) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to uncompress %s", config.update_file);
+        log_message(log_fp, msg);
+        if (log_fp) fclose(log_fp);
+        exit(EXIT_FAILURE);
     }
 
-    if (status == 0) {
-        log_message(log_fp, "Firmware update completed successfully. Rebooting in 5 seconds...");
-        if (log_fp) fclose(log_fp); // Close log file before forking
-        pid_t pid = fork();
-        if (pid == 0) { // Child process
-            sleep(5);
-            if (reboot(RB_AUTOBOOT) < 0) {
-                fprintf(stderr, "ERROR: Failed to reboot device: %s\n", strerror(errno));
-                exit(EXIT_FAILURE);
-            }
-            exit(0);
-        }
-    } else {
-        log_message(log_fp, "Firmware update failed");
+    // Generate signature file path (assume .sig extension)
+    char sig_file[256];
+    snprintf(sig_file, sizeof(sig_file), "%s/firmware.sig", config.temp_dir);
+    if (access(sig_file, F_OK | R_OK) != 0) {
+        snprintf(msg, sizeof(msg), "ERROR: Signature file %s doesn't exist or is not readable", sig_file);
+        log_message(log_fp, msg);
         if (log_fp) fclose(log_fp);
+        exit(EXIT_FAILURE);
+    }
+
+    // Verify the tar file signature
+    snprintf(msg, sizeof(msg), "Verifying update file signature...");
+    log_message(log_fp, msg);
+
+    char compressed_update_file[256];
+    snprintf(compressed_update_file, sizeof(compressed_update_file), "%s/output_img.tar.gz", config.temp_dir);
+
+    if (verify_firmware(compressed_update_file, sig_file, config.public_key, log_fp) != 0) {
+        snprintf(msg, sizeof(msg), "ERROR: Signature verification failed for %s", compressed_update_file);
+        log_message(log_fp, msg);
+        if (log_fp) fclose(log_fp);
+        exit(EXIT_FAILURE);
+    }
+
+    // Uncompress the tar file
+    snprintf(msg, sizeof(msg), "Uncompressing image file %s...", compressed_update_file);
+    log_message(log_fp, msg);
+    if (uncompress_tar(compressed_update_file, config.temp_dir, log_fp) != 0) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to uncompress %s", compressed_update_file);
+        log_message(log_fp, msg);
+        if (log_fp) fclose(log_fp);
+        exit(EXIT_FAILURE);
+    }
+
+    // Assume the tar file contains a single firmware image (e.g., firmware.bin)
+    char new_rootfs[256];
+    snprintf(new_rootfs, sizeof(new_rootfs), "%s/rootfs.ext2", config.temp_dir);
+
+    // Check if extracted firmware file exists
+    if (access(new_rootfs, F_OK | R_OK) != 0) {
+        snprintf(msg, sizeof(msg), "ERROR: Extracted rootfs file %s not found", new_rootfs);
+        log_message(log_fp, msg);
+        if (log_fp) fclose(log_fp);
+        exit(EXIT_FAILURE);
+    }
+
+    // Detect rootfs
+    if (detect_rootfs(&config, log_fp) != 0) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to detect rootfs");
+        log_message(log_fp, msg);
+        if (log_fp) fclose(log_fp);
+        exit(EXIT_FAILURE);
+    }
+
+    // Install the extracted firmware to the next rootfs
+    if (install_firmware(new_rootfs, config.next_rootfs, log_fp) != 0) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to install firmware to %s", config.next_rootfs);
+        log_message(log_fp, msg);
+        if (log_fp) fclose(log_fp);
+        exit(EXIT_FAILURE);
+    }
+
+    // Update boot configuration
+    if (update_boot_config(&config, log_fp) != 0) {
+        snprintf(msg, sizeof(msg), "ERROR: Failed to update boot configuration");
+        log_message(log_fp, msg);
+        if (log_fp) fclose(log_fp);
+        exit(EXIT_FAILURE);
+    }
+
+    // Clean up temporary directory
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", config.temp_dir);
+    if (system(cmd) != 0) {
+        snprintf(msg, sizeof(msg), "WARNING: Failed to clean up temporary directory %s", config.temp_dir);
+        log_message(log_fp, msg);
+    }
+
+    snprintf(msg, sizeof(msg), "Firmware update completed successfully. Rebooting in 5 seconds...");
+    log_message(log_fp, msg);
+    if (log_fp) fclose(log_fp); // Close log file before forking
+    pid_t pid = fork();
+    if (pid == 0) { // Child process
+        sleep(5);
+        if (reboot(RB_AUTOBOOT) < 0) {
+            fprintf(stderr, "ERROR: Failed to reboot device: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        exit(0);
     }
 
     cleanup_config(&config);
-    return status == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return EXIT_SUCCESS;
 }
